@@ -1,0 +1,46 @@
+# Rendered by the nginx image's entrypoint (envsubst) at container start.
+# Variables: PORT, BACKEND_UPSTREAM, NGINX_RESOLVER (defaults are set in the Dockerfile).
+server {
+    listen ${PORT};
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Docker's embedded DNS. Using a variable in proxy_pass below means nginx resolves the
+    # backend lazily, so the container still starts on hosts where "backend" does not exist.
+    resolver ${NGINX_RESOLVER} valid=10s ipv6=off;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    # Local/compose mode: the browser calls /api on the frontend, nginx forwards it to the backend
+    # service over the Docker network alias. In production the browser calls the backend URL directly
+    # (API_BASE_URL) and this block is simply unused.
+    location /api/ {
+        set $backend "${BACKEND_UPSTREAM}";
+        proxy_pass $backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Runtime config must never be cached.
+    location = /config.js {
+        add_header Cache-Control "no-store";
+    }
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Single-page app fallback.
+    location / {
+        try_files $uri /index.html;
+    }
+}

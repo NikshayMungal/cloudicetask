@@ -1,0 +1,33 @@
+# ---------- Secrets & environment ----------
+.env
+.env.*
+!.env.example
+*.pfx
+*.key
+appsettings.Development.json
+appsettings.Production.json
+secrets.json
+
+# ---------- .NET ----------
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+.vs/
+TestResults/
+coverage*/
+*.trx
+
+# ---------- Node / Vite ----------
+node_modules/
+dist/
+npm-debug.log*
+*.local
+
+# ---------- IDEs & OS ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

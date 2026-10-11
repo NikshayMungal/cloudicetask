@@ -1,0 +1,60 @@
+# Runs the whole stack locally:   docker compose up --build
+#   Frontend  -> http://localhost:3000
+#   API/Swagger -> http://localhost:5000/swagger
+#
+# NOTE: this file is for LOCAL development only. In production the frontend and backend are deployed
+# as separate containers and the database is a hosted free-tier PostgreSQL (Neon/Supabase), because a
+# database inside a free-hosting container is wiped on every restart.
+name: logistics-tracker
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-logistics}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-logistics}
+    volumes:
+      - pgdata:/var/lib/postgresql/data      # named volume: data survives `docker compose down`
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy           # wait until Postgres accepts connections
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+      # "db" is the Docker network alias of the database service above.
+      ConnectionStrings__Default: Host=db;Port=5432;Database=${POSTGRES_DB:-logistics};Username=${POSTGRES_USER:-logistics};Password=${POSTGRES_PASSWORD:-change-me-locally}
+      Cors__AllowedOrigins: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      SeedDemoData: ${SEED_DEMO_DATA:-true}
+    ports:
+      - "${BACKEND_PORT:-5000}:8080"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      # nginx forwards /api/* to the backend using its network alias - no CORS or hard-coded IPs needed.
+      BACKEND_UPSTREAM: http://backend:8080
+      API_BASE_URL: ${API_BASE_URL:-}
+    ports:
+      - "${FRONTEND_PORT:-3000}:8080"
+
+volumes:
+  pgdata:

@@ -1,0 +1,234 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege by default; jobs that need more declare it themselves.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: 8.0.x
+  NODE_VERSION: "20"
+  REGISTRY: ghcr.io
+
+jobs:
+  # ------------------------------------------------------------------ 1. Backend: build + unit tests
+  backend:
+    name: Backend build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore backend/LogisticsTracker.sln
+
+      - name: Build
+        run: dotnet build backend/LogisticsTracker.sln --no-restore -c Release
+
+      - name: Unit tests
+        run: >
+          dotnet test backend/LogisticsTracker.sln --no-build -c Release
+          --logger "trx;LogFileName=test-results.trx" --collect:"XPlat Code Coverage"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: backend/**/TestResults/**
+
+      # Dependency scan: fail the build if any NuGet package has a known vulnerability.
+      - name: NuGet vulnerability check
+        run: |
+          dotnet list backend/LogisticsTracker.sln package --vulnerable --include-transitive 2>&1 | tee vulnerabilities.txt
+          if grep -q "has the following vulnerable packages" vulnerabilities.txt; then
+            echo "::error::Vulnerable NuGet packages found (see log)."
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------ 2. Frontend: build + audit
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run build
+
+      # Dependency scan of production packages.
+      - name: npm audit
+        run: npm audit --omit=dev --audit-level=high
+
+  # ------------------------------------------------------------------ 3. Static analysis (CodeQL)
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [csharp, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ------------------------------------------------------------------ 4. Docker: build, Trivy scan, push to GHCR
+  docker:
+    name: Docker (${{ matrix.service }})
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Image names must be lowercase.
+      - name: Compute image name
+        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}-${{ matrix.service }}" >> "$GITHUB_ENV"
+
+      - name: Build image (loaded locally for scanning)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          load: true
+          tags: ${{ env.IMAGE }}:scan
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # Fails the pipeline on HIGH/CRITICAL vulnerabilities that already have a fix available.
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:scan
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+  # ------------------------------------------------------------------ 5. Compose: whole stack builds and starts
+  compose:
+    name: docker compose smoke test
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env from the example file
+        run: cp .env.example .env
+
+      - name: Build all services
+        run: docker compose build
+
+      - name: Start the stack and check it responds
+        run: |
+          docker compose up -d
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:5000/health/db && curl -fsS http://localhost:3000/ > /dev/null; then
+              echo "Stack is healthy."; exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::Stack did not become healthy."
+          docker compose logs
+          exit 1
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ------------------------------------------------------------------ 6. Deploy (main only)
+  deploy:
+    name: Deploy to Render
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [backend, frontend, codeql, docker, compose]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Compute image names
+        run: |
+          echo "BACKEND_IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}-backend:${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "FRONTEND_IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}-frontend:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      # Render "deploy hooks" are secret URLs. imgURL tells Render which image tag to run.
+      - name: Trigger backend deploy
+        env:
+          HOOK: ${{ secrets.RENDER_BACKEND_DEPLOY_HOOK }}
+        run: curl --fail --silent --show-error -X POST -G --data-urlencode "imgURL=${BACKEND_IMAGE}" "$HOOK"
+
+      - name: Trigger frontend deploy
+        env:
+          HOOK: ${{ secrets.RENDER_FRONTEND_DEPLOY_HOOK }}
+        run: curl --fail --silent --show-error -X POST -G --data-urlencode "imgURL=${FRONTEND_IMAGE}" "$HOOK"
+
+      # Optional: set repository variables BACKEND_URL and FRONTEND_URL to enable.
+      # Free services sleep, so allow several minutes for a cold start plus the new deploy.
+      - name: Smoke test live site
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL }}
+          FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+        run: |
+          [ -z "$BACKEND_URL" ] && { echo "BACKEND_URL not set - skipping smoke test."; exit 0; }
+          for i in $(seq 1 30); do
+            if curl -fsS "$BACKEND_URL/health/db" && { [ -z "$FRONTEND_URL" ] || curl -fsS -o /dev/null "$FRONTEND_URL"; }; then
+              echo "Live site is responding."; exit 0
+            fi
+            echo "Waiting for services (attempt $i/30)..."; sleep 10
+          done
+          echo "::error::Live site did not respond in time."; exit 1
