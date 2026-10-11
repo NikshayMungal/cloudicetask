@@ -9,7 +9,7 @@ COPY . .
 RUN npm run build
 
 # ---------- Runtime stage: nginx serving static files (non-root) ----------
-FROM nginxinc/nginx-unprivileged:1.27-alpine AS final
+FROM nginxinc/nginx-unprivileged:1.31-alpine AS final
 
 # Runtime configuration (overridable with `docker run -e` / compose / the hosting dashboard).
 #   PORT              port nginx listens on (Render injects its own)
