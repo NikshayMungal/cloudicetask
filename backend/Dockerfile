@@ -12,7 +12,7 @@ COPY LogisticsTracker.Api/ LogisticsTracker.Api/
 RUN dotnet publish LogisticsTracker.Api/LogisticsTracker.Api.csproj -c Release -o /app/publish --no-restore
 
 # ---------- Runtime stage: small image, non-root user ----------
-FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
 COPY --from=build /app/publish .
 
